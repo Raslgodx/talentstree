@@ -1,25 +1,19 @@
 const WOWHEAD_ICON_BASE = "https://wow.zamimg.com/images/wow/icons/large/";
 const SVG_NS = "http://www.w3.org/2000/svg";
+
+// --------- CALIBRATION (temporary, for cal=1) ---------
 const CALIBRATION = {
   code: "CkQAAAAAAAAAAAAAAAAAAAAAAwMzYGNbjx2MzMzyAAAmZmlZbmZWGDAYBGY2MaMDIzCYZAAAwAAAzMYYMzsNzMzMMzMzMDzMzAAMAA",
   expectedTaken: new Set([
     // class (left)
     71931, 71933, 71949, 71948, 71922, 109847,
-
     // spec (right)
-    72049, 72050, 72047, 72032, 109860, 72054,
-    110269, 72046, 109849, 72034, 109850, 109853
-
-    // hero (center): "all talents" — это мы отдельно проверим по subtree nodes
+    72049, 72050, 72047, 72032, 109860, 72054, 110269, 72046, 109849, 72034, 109850, 109853
   ]),
   expectedHeroAll: true
 };
 
-
-// Talent export alphabet
-const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const ALPHABET_URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
+// --------- helpers ---------
 function wowheadIconUrl(iconName) {
   if (!iconName) return null;
   return `${WOWHEAD_ICON_BASE}${String(iconName).toLowerCase()}.jpg`;
@@ -41,17 +35,15 @@ function escapeHtml(str) {
 }
 
 function getQuery() {
-  cal: u.searchParams.get("cal") === "1"
-
   const u = new URL(window.location.href);
   return {
     spec: (u.searchParams.get("spec") || "affliction").toLowerCase(),
     code: (u.searchParams.get("code") || "").trim(),
-    hero: (u.searchParams.get("hero") || "").toLowerCase(), // <-- добавили
-    debug: u.searchParams.get("debug") === "1"
+    hero: (u.searchParams.get("hero") || "").toLowerCase(),
+    debug: u.searchParams.get("debug") === "1",
+    cal: u.searchParams.get("cal") === "1"
   };
 }
-
 
 function specKeyToName(key) {
   const k = (key || "").toLowerCase();
@@ -60,21 +52,19 @@ function specKeyToName(key) {
   if (k === "destruction") return "Destruction";
   return "Affliction";
 }
-function heroKeyToSubTreeId(heroKey) {
-  // по твоему JSON:
-  // 57 = Soul Harvester
-  // 58 = Hellcaller
-  // 59 = Diabolist
-  if (!heroKey) return null;
 
+function heroKeyToSubTreeId(heroKey) {
+  // per your JSON:
+  // 57 = Soul Harvester, 58 = Hellcaller, 59 = Diabolist
+  if (!heroKey) return null;
   const k = heroKey.toLowerCase();
   if (k === "soulharvester") return 57;
   if (k === "hellcaller") return 58;
   if (k === "diabolist") return 59;
-
   return null;
 }
 
+// --------- data/model ---------
 async function loadModels() {
   const res = await fetch("./talents.json", { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to load talents.json");
@@ -86,7 +76,6 @@ function buildNodeIndex(model) {
   for (const n of model.classNodes || []) idx.set(n.id, { ...n, _tree: "class" });
   for (const n of model.specNodes || []) idx.set(n.id, { ...n, _tree: "spec" });
   for (const n of model.heroNodes || []) idx.set(n.id, { ...n, _tree: "hero" });
-  // subTreeNodes are not rendered as nodes in your dataset; they are like "tabs"
   model._nodeIndex = idx;
   return model;
 }
@@ -97,35 +86,15 @@ function pickModel(models, specKey) {
   if (!model) throw new Error(`Model not found for spec=${specName}`);
   return buildNodeIndex(model);
 }
-function determineActiveHeroSubTreeId(model, selections) {
-  const subTree = (model.subTreeNodes || []).find((x) => x.type === "subtree") || (model.subTreeNodes || [])[0];
-  if (!subTree || !Array.isArray(subTree.entries)) return null;
 
-  // entries: [{ name, traitSubTreeId, nodes:[...] }, ...]
-  let best = { traitSubTreeId: null, score: -1 };
-
-  for (const e of subTree.entries) {
-    const nodeIds = Array.isArray(e.nodes) ? e.nodes : [];
-    let score = 0;
-    for (const id of nodeIds) {
-      if (selections?.get(id)?.taken) score++;
-    }
-    if (score > best.score) best = { traitSubTreeId: e.traitSubTreeId, score };
-  }
-
-  // Если строка пустая или геройка не выбрана, score может быть 0 у всех
-  if (best.score <= 0) return null;
-
-  return best.traitSubTreeId;
-}
-
-
-// --------- decoder (best-effort, tweakable) ---------
+// --------- decoder ---------
+const ALPHABET_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const ALPHABET_URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 function decodeToBits(code, { alphabet = "std", bitOrder = "lsb" } = {}) {
-  const table = alphabet === "url" ? ALPHABET_URL : ALPHABET;
-
+  const table = alphabet === "url" ? ALPHABET_URL : ALPHABET_STD;
   const bits = [];
+
   for (const ch of code.trim()) {
     const idx = table.indexOf(ch);
     if (idx < 0) continue;
@@ -136,6 +105,7 @@ function decodeToBits(code, { alphabet = "std", bitOrder = "lsb" } = {}) {
       for (let b = 5; b >= 0; b--) bits.push((idx >> b) & 1);
     }
   }
+
   return bits;
 }
 
@@ -166,18 +136,14 @@ class BitReader {
 
 function bitsNeededForMaxRanks(maxRanks) {
   if (maxRanks <= 1) return 0;
-  if (maxRanks <= 2) return 1; // 0..1 (+1)
-  if (maxRanks <= 4) return 2; // 0..3 (+1)
+  if (maxRanks <= 2) return 1;
+  if (maxRanks <= 4) return 2;
   if (maxRanks <= 8) return 3;
   return 4;
 }
 
 function decodeSelections({ code, model, debug, opts }) {
-  const {
-    headerVarInts = 4,
-    alphabet = "std", // std|url
-    bitOrder = "lsb"  // lsb|msb
-  } = opts || {};
+  const { headerVarInts = 4, alphabet = "std", bitOrder = "lsb" } = opts || {};
 
   const bits = decodeToBits(code, { alphabet, bitOrder });
   const br = new BitReader(bits);
@@ -191,7 +157,7 @@ function decodeSelections({ code, model, debug, opts }) {
   for (const nodeId of model.fullNodeOrder || []) {
     const node = model._nodeIndex.get(nodeId);
 
-    // ВАЖНО: чтобы не "съезжать", мы обязаны читать данные даже для неизвестных нод.
+    // IMPORTANT: keep alignment even for unknown nodes
     const maxRanks = node?.maxRanks ?? 1;
     const nodeType = node?.type ?? "single";
 
@@ -202,8 +168,7 @@ function decodeSelections({ code, model, debug, opts }) {
 
     if (taken) {
       if (nodeType === "choice") {
-        // чаще всего достаточно 2 бит, но иногда 1 (если всегда 2 опции).
-        // оставим 2, а при калибровке можно будет добавить режим "choiceBits=1"
+        // typical: 2 bits enough for 2 options; real format can differ
         choiceEntryIndex = br.read(2);
         ranksTaken = 1;
       } else if (nodeType === "tiered") {
@@ -222,46 +187,69 @@ function decodeSelections({ code, model, debug, opts }) {
   return byNodeId;
 }
 
+// --------- calibration (cal=1) ---------
+function scoreDecode(model, selections) {
+  let score = 0;
 
-  const byNodeId = new Map();
+  for (const id of CALIBRATION.expectedTaken) {
+    const taken = selections.get(id)?.taken === true;
+    score += taken ? 2 : -2;
+  }
 
-  for (const nodeId of model.fullNodeOrder || []) {
-    const node = model._nodeIndex.get(nodeId);
+  if (CALIBRATION.expectedHeroAll) {
+    const subTree = (model.subTreeNodes || [])[0];
+    if (subTree?.entries?.length) {
+      let best = { nodes: [], taken: -1, traitSubTreeId: null };
 
-    // Node exists in encoding even if not in the three arrays (class/spec/hero).
-    // To keep alignment, we STILL have to consume bits for unknown nodes.
-    const maxRanks = node?.maxRanks ?? 1;
-    const nodeType = node?.type ?? "single";
-    const taken = br.read(1) === 1;
-
-    let ranksTaken = 0;
-    let choiceEntryIndex = null;
-
-    if (taken) {
-      if (nodeType === "choice") {
-        choiceEntryIndex = br.read(2);
-        ranksTaken = 1;
-      } else if (nodeType === "tiered") {
-        // total ranks 0..7 stored in 3 bits in many exports
-        ranksTaken = br.read(3);
-        if (ranksTaken > maxRanks) ranksTaken = maxRanks;
-      } else {
-        const bn = bitsNeededForMaxRanks(maxRanks);
-        ranksTaken = bn ? br.read(bn) + 1 : 1;
-        if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+      for (const e of subTree.entries) {
+        let cnt = 0;
+        for (const nid of e.nodes || []) if (selections.get(nid)?.taken) cnt++;
+        if (cnt > best.taken) best = { nodes: e.nodes || [], taken: cnt, traitSubTreeId: e.traitSubTreeId };
       }
-    }
 
-    if (node) {
-      byNodeId.set(nodeId, { taken, ranksTaken, maxRanks, choiceEntryIndex });
+      let all = true;
+      for (const nid of best.nodes) {
+        if (!selections.get(nid)?.taken) {
+          all = false;
+          break;
+        }
+      }
+
+      score += all ? 10 : -10;
     }
   }
 
-  return byNodeId;
+  return score;
+}
+
+function calibrateDecoder(model) {
+  const candidates = [];
+
+  for (const alphabet of ["std", "url"]) {
+    for (const bitOrder of ["lsb", "msb"]) {
+      for (let headerVarInts = 0; headerVarInts <= 12; headerVarInts++) {
+        try {
+          const selections = decodeSelections({
+            code: CALIBRATION.code,
+            model,
+            debug: false,
+            opts: { alphabet, bitOrder, headerVarInts }
+          });
+
+          const score = scoreDecode(model, selections);
+          candidates.push({ alphabet, bitOrder, headerVarInts, score });
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0] || null;
 }
 
 // --------- render ---------
-
 function computeBounds(nodes) {
   let minX = Infinity,
     minY = Infinity,
@@ -276,64 +264,6 @@ function computeBounds(nodes) {
   }
   return { minX, minY, maxX, maxY };
 }
-function scoreDecode(model, selections) {
-  // score: +2 за совпадение taken, -2 за расхождение на эталонных нодах
-  let score = 0;
-  for (const id of CALIBRATION.expectedTaken) {
-    const taken = selections.get(id)?.taken === true;
-    if (taken) score += 2;
-    else score -= 2;
-  }
-
-  // hero "all talents": проверим, что для выбранного subTreeId все ноды taken
-  if (CALIBRATION.expectedHeroAll) {
-    const subTree = (model.subTreeNodes || [])[0];
-    if (subTree?.entries?.length) {
-      // берём ветку где больше taken
-      let best = { nodes: [], taken: -1, traitSubTreeId: null };
-      for (const e of subTree.entries) {
-        let cnt = 0;
-        for (const nid of e.nodes || []) if (selections.get(nid)?.taken) cnt++;
-        if (cnt > best.taken) best = { nodes: e.nodes || [], taken: cnt, traitSubTreeId: e.traitSubTreeId };
-      }
-      // хотим, чтобы "все" в этой ветке были taken
-      let all = true;
-      for (const nid of best.nodes) {
-        if (!selections.get(nid)?.taken) { all = false; break; }
-      }
-      score += all ? 10 : -10;
-    }
-  }
-
-  return score;
-}
-
-function calibrateDecoder(model) {
-  const candidates = [];
-
-  for (const alphabet of ["std", "url"]) {
-    for (const bitOrder of ["lsb", "msb"]) {
-      for (let headerVarInts = 0; headerVarInts <= 10; headerVarInts++) {
-        try {
-          const selections = decodeSelections({
-            code: CALIBRATION.code,
-            model,
-            debug: false,
-            opts: { alphabet, bitOrder, headerVarInts }
-          });
-          const score = scoreDecode(model, selections);
-          candidates.push({ alphabet, bitOrder, headerVarInts, score });
-        } catch {
-          // ignore
-        }
-      }
-    }
-  }
-
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates[0] || null;
-}
-
 
 function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   svg.innerHTML = "";
@@ -342,15 +272,13 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   const H = 820;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
 
-  const activeHeroSubTreeId = determineActiveHeroSubTreeId(model, selections);
+  const heroNodesFiltered = (model.heroNodes || []).filter((n) => {
+    if (!heroSubTreeId) return false; // if hero param not set -> hide center
+    return n.subTreeId === heroSubTreeId;
+  });
 
-const heroNodesFiltered = (model.heroNodes || []).filter((n) => {
-  if (!heroSubTreeId) return false; // если параметр hero не передали — центр пустой
-  return n.subTreeId === heroSubTreeId;
-});
-
-const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.specNodes || [])];
-
+  const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.specNodes || [])];
+  if (!allNodes.length) return;
 
   const bounds = computeBounds(allNodes);
 
@@ -377,8 +305,11 @@ const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.s
     for (const toId of n.next) {
       const m = model._nodeIndex.get(toId);
       if (!m) continue;
-      const b = toScreen(m.posX, m.posY);
 
+      // do not draw edges that go to a hidden hero node
+      if (m._tree === "hero" && heroSubTreeId && m.subTreeId !== heroSubTreeId) continue;
+
+      const b = toScreen(m.posX, m.posY);
       const active = isActive(n.id) && isActive(toId);
 
       edgesG.appendChild(
@@ -409,7 +340,6 @@ const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.s
       choiceEntryIndex: null
     };
 
-    // which entry to show for choice nodes
     let entry = n.entries?.[0] ?? null;
     if (n.type === "choice" && sel.taken && typeof sel.choiceEntryIndex === "number") {
       entry = n.entries?.[sel.choiceEntryIndex] ?? n.entries?.[0] ?? entry;
@@ -496,40 +426,28 @@ const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.s
 }
 
 // --------- boot ---------
-
 (async function main() {
   const svg = document.getElementById("talentSvg");
   const tooltipEl = document.getElementById("tooltip");
 
   const q = getQuery();
-const models = await loadModels();
-const model = pickModel(models, q.spec);
-
-// 1) если cal=1 — подбираем параметры и печатаем
-let decoderOpts = { headerVarInts: 4, alphabet: "std", bitOrder: "lsb" };
-
-if (q.cal) {
-  const best = calibrateDecoder(model);
-  console.log("BEST DECODER OPTS:", best);
-  if (best) decoderOpts = best;
-}
-
-// 2) обычный декод (для любого code)
-let selections = new Map();
-if (q.code) {
-  selections = decodeSelections({ code: q.code, model, debug: q.debug, opts: decoderOpts });
-}
-
-render(model, selections, svg, tooltipEl, heroKeyToSubTreeId?.(q.hero) ?? null);
-
   const models = await loadModels();
   const model = pickModel(models, q.spec);
 
+  // Default decoder params (will be overridden when cal=1 finds better)
+  let decoderOpts = { headerVarInts: 4, alphabet: "std", bitOrder: "lsb" };
+
+  if (q.cal) {
+    const best = calibrateDecoder(model);
+    console.log("BEST DECODER OPTS:", best);
+    if (best) decoderOpts = best;
+  }
+
   let selections = new Map();
   if (q.code) {
-    selections = decodeSelections({ code: q.code, model, debug: q.debug });
+    selections = decodeSelections({ code: q.code, model, debug: q.debug, opts: decoderOpts });
   }
+
   const heroSubTreeId = heroKeyToSubTreeId(q.hero);
-  render(model, selections, svg, tooltipEl, heroSubTreeId);;
-  
+  render(model, selections, svg, tooltipEl, heroSubTreeId);
 })();
