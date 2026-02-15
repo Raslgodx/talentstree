@@ -261,11 +261,20 @@ function debugCompareAgainstCalibration(selections) {
 function scoreDecode(model, selections) {
   let score = 0;
 
+  // reward for expected taken
   for (const id of CALIBRATION.expectedTaken) {
     const taken = selections.get(id)?.taken === true;
-    score += taken ? 2 : -2;
+    score += taken ? 5 : -5;
   }
 
+  // penalty for extras (taken but not expected)
+  let extraCount = 0;
+  for (const [id, s] of selections.entries()) {
+    if (s?.taken && !CALIBRATION.expectedTaken.has(id)) extraCount++;
+  }
+  score -= extraCount * 1; // мягкий штраф
+
+  // hero "all" check (as before)
   if (CALIBRATION.expectedHeroAll) {
     const subTree = (model.subTreeNodes || [])[0];
     if (subTree?.entries?.length) {
@@ -279,22 +288,21 @@ function scoreDecode(model, selections) {
 
       let all = true;
       for (const nid of best.nodes) {
-        if (!selections.get(nid)?.taken) {
-          all = false;
-          break;
-        }
+        if (!selections.get(nid)?.taken) { all = false; break; }
       }
-      score += all ? 10 : -10;
+      score += all ? 15 : -15;
     }
   }
 
   return score;
 }
 
+
 function calibrateDecoder(model) {
   const candidates = [];
 
-  const headerRange = Array.from({ length: 41 }, (_, i) => i); // 0..40
+  const headerRange = Array.from({ length: 21 }, (_, i) => i); // 0..20
+
   const choiceModes = ["byEntryCount", "fixed1", "fixed2"];
   const choiceExtraBits = [false, true];
   const rankModes = ["plus1", "raw", "tiered3"];
