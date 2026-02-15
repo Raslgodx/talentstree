@@ -143,21 +143,26 @@ function bitsNeededForMaxRanks(maxRanks) {
 }
 
 function decodeSelections({ code, model, debug, opts }) {
-  const { headerVarInts = 4, alphabet = "std", bitOrder = "lsb" } = opts || {};
+  const {
+    headerVarInts = 4,
+    alphabet = "std",
+    bitOrder = "lsb",
+    choiceBits = 2,      // NEW: 1 or 2
+    rankMode = "plus1"   // NEW: "plus1" | "raw" | "tiered3"
+  } = opts || {};
 
   const bits = decodeToBits(code, { alphabet, bitOrder });
   const br = new BitReader(bits);
 
   const header = [];
   for (let i = 0; i < headerVarInts; i++) header.push(br.readVarInt());
-  if (debug) console.log("header:", header, { headerVarInts, alphabet, bitOrder });
+  if (debug) console.log("header:", header, { headerVarInts, alphabet, bitOrder, choiceBits, rankMode });
 
   const byNodeId = new Map();
 
   for (const nodeId of model.fullNodeOrder || []) {
     const node = model._nodeIndex.get(nodeId);
 
-    // IMPORTANT: keep alignment even for unknown nodes
     const maxRanks = node?.maxRanks ?? 1;
     const nodeType = node?.type ?? "single";
 
@@ -168,16 +173,29 @@ function decodeSelections({ code, model, debug, opts }) {
 
     if (taken) {
       if (nodeType === "choice") {
-        // typical: 2 bits enough for 2 options; real format can differ
-        choiceEntryIndex = br.read(2);
+        choiceEntryIndex = br.read(choiceBits);
         ranksTaken = 1;
-      } else if (nodeType === "tiered") {
-        ranksTaken = br.read(3);
-        if (ranksTaken > maxRanks) ranksTaken = maxRanks;
       } else {
+        // ranks decoding variants
         const bn = bitsNeededForMaxRanks(maxRanks);
-        ranksTaken = bn ? br.read(bn) + 1 : 1;
-        if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+
+        if (bn === 0) {
+          ranksTaken = 1;
+        } else if (rankMode === "raw") {
+          // read raw 0..(2^bn-1), clamp; allow 0 to mean 1
+          ranksTaken = br.read(bn);
+          if (ranksTaken <= 0) ranksTaken = 1;
+          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+        } else if (rankMode === "tiered3") {
+          // always 3 bits for ranks when taken
+          ranksTaken = br.read(3);
+          if (ranksTaken <= 0) ranksTaken = 1;
+          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+        } else {
+          // "plus1"
+          ranksTaken = br.read(bn) + 1;
+          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+        }
       }
     }
 
@@ -186,6 +204,7 @@ function decodeSelections({ code, model, debug, opts }) {
 
   return byNodeId;
 }
+
 
 // --------- calibration (cal=1) ---------
 function scoreDecode(model, selections) {
@@ -227,19 +246,23 @@ function calibrateDecoder(model) {
 
   for (const alphabet of ["std", "url"]) {
     for (const bitOrder of ["lsb", "msb"]) {
-      for (let headerVarInts = 0; headerVarInts <= 12; headerVarInts++) {
-        try {
-          const selections = decodeSelections({
-            code: CALIBRATION.code,
-            model,
-            debug: false,
-            opts: { alphabet, bitOrder, headerVarInts }
-          });
+      for (const headerVarInts of Array.from({ length: 21 }, (_, i) => i)) { // 0..20
+        for (const choiceBits of [1, 2]) {
+          for (const rankMode of ["plus1", "raw", "tiered3"]) {
+            try {
+              const selections = decodeSelections({
+                code: CALIBRATION.code,
+                model,
+                debug: false,
+                opts: { alphabet, bitOrder, headerVarInts, choiceBits, rankMode }
+              });
 
-          const score = scoreDecode(model, selections);
-          candidates.push({ alphabet, bitOrder, headerVarInts, score });
-        } catch {
-          // ignore
+              const score = scoreDecode(model, selections);
+              candidates.push({ alphabet, bitOrder, headerVarInts, choiceBits, rankMode, score });
+            } catch {
+              // ignore
+            }
+          }
         }
       }
     }
@@ -248,6 +271,7 @@ function calibrateDecoder(model) {
   candidates.sort((a, b) => b.score - a.score);
   return candidates[0] || null;
 }
+
 
 // --------- render ---------
 function computeBounds(nodes) {
