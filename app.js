@@ -173,9 +173,15 @@ function decodeSelections({ code, model, debug, opts }) {
 
     if (taken) {
       if (nodeType === "choice") {
-        choiceEntryIndex = br.read(choiceBits);
-        ranksTaken = 1;
-      } else {
+  const entryCount = Array.isArray(node?.entries) ? node.entries.length : 2;
+
+  // 2 варианта -> 1 бит, 3-4 варианта -> 2 бита
+  const cb = entryCount <= 2 ? 1 : 2;
+
+  choiceEntryIndex = br.read(cb);
+  ranksTaken = 1;
+}
+ else {
         // ranks decoding variants
         const bn = bitsNeededForMaxRanks(maxRanks);
 
