@@ -63,6 +63,28 @@ function pickModel(models, specKey) {
   if (!model) throw new Error(`Model not found for spec=${specName}`);
   return buildNodeIndex(model);
 }
+function determineActiveHeroSubTreeId(model, selections) {
+  const subTree = (model.subTreeNodes || []).find((x) => x.type === "subtree") || (model.subTreeNodes || [])[0];
+  if (!subTree || !Array.isArray(subTree.entries)) return null;
+
+  // entries: [{ name, traitSubTreeId, nodes:[...] }, ...]
+  let best = { traitSubTreeId: null, score: -1 };
+
+  for (const e of subTree.entries) {
+    const nodeIds = Array.isArray(e.nodes) ? e.nodes : [];
+    let score = 0;
+    for (const id of nodeIds) {
+      if (selections?.get(id)?.taken) score++;
+    }
+    if (score > best.score) best = { traitSubTreeId: e.traitSubTreeId, score };
+  }
+
+  // Если строка пустая или геройка не выбрана, score может быть 0 у всех
+  if (best.score <= 0) return null;
+
+  return best.traitSubTreeId;
+}
+
 
 // --------- decoder (best-effort, tweakable) ---------
 
@@ -186,7 +208,19 @@ function render(model, selections, svg, tooltipEl) {
   const H = 820;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
 
-  const allNodes = [...(model.classNodes || []), ...(model.heroNodes || []), ...(model.specNodes || [])];
+  const activeHeroSubTreeId = determineActiveHeroSubTreeId(model, selections);
+
+const heroNodesFiltered = (model.heroNodes || []).filter((n) => {
+  // Если не удалось определить (например, code пустой), можно:
+  // - либо не показывать hero вообще
+  // - либо показывать обе (как сейчас)
+  // Я сделаю "не показывать hero", чтобы было строго.
+  if (!activeHeroSubTreeId) return false;
+  return n.subTreeId === activeHeroSubTreeId;
+});
+
+const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.specNodes || [])];
+
   const bounds = computeBounds(allNodes);
 
   const pad = 60;
