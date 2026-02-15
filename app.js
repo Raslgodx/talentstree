@@ -204,6 +204,23 @@ function decodeSelections({ code, model, debug, opts }) {
 
   return byNodeId;
 }
+function debugCompareAgainstCalibration(selections) {
+  const missing = [];
+  const extra = [];
+
+  for (const id of CALIBRATION.expectedTaken) {
+    if (!selections.get(id)?.taken) missing.push(id);
+  }
+
+  // extras: taken=true, но не ожидается (ограничим вывод 50)
+  for (const [id, s] of selections.entries()) {
+    if (s?.taken && !CALIBRATION.expectedTaken.has(id)) extra.push(id);
+  }
+
+  console.log("CALIBRATION missing(expected but not taken):", missing);
+  console.log("CALIBRATION extra(taken but not expected):", extra.slice(0, 50), extra.length > 50 ? `(and ${extra.length - 50} more)` : "");
+}
+
 
 
 // --------- calibration (cal=1) ---------
@@ -459,7 +476,17 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   const model = pickModel(models, q.spec);
 
   // Default decoder params (will be overridden when cal=1 finds better)
-  let decoderOpts = { headerVarInts: 4, alphabet: "std", bitOrder: "lsb" };
+  let decoderOpts = {
+  alphabet: "std",
+  bitOrder: "lsb",
+  headerVarInts: 17,
+  choiceBits: 2,
+  rankMode: "plus1"
+};
+  if (q.debug && q.code === CALIBRATION.code) {
+  debugCompareAgainstCalibration(selections);
+}
+
 
   if (q.cal) {
     const best = calibrateDecoder(model);
