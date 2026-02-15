@@ -1,8 +1,24 @@
 const WOWHEAD_ICON_BASE = "https://wow.zamimg.com/images/wow/icons/large/";
 const SVG_NS = "http://www.w3.org/2000/svg";
+const CALIBRATION = {
+  code: "CkQAAAAAAAAAAAAAAAAAAAAAAwMzYGNbjx2MzMzyAAAmZmlZbmZWGDAYBGY2MaMDIzCYZAAAwAAAzMYYMzsNzMzMMzMzMDzMzAAMAA",
+  expectedTaken: new Set([
+    // class (left)
+    71931, 71933, 71949, 71948, 71922, 109847,
+
+    // spec (right)
+    72049, 72050, 72047, 72032, 109860, 72054,
+    110269, 72046, 109849, 72034, 109850, 109853
+
+    // hero (center): "all talents" — это мы отдельно проверим по subtree nodes
+  ]),
+  expectedHeroAll: true
+};
+
 
 // Talent export alphabet
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const ALPHABET_URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 function wowheadIconUrl(iconName) {
   if (!iconName) return null;
@@ -25,6 +41,8 @@ function escapeHtml(str) {
 }
 
 function getQuery() {
+  cal: u.searchParams.get("cal") === "1"
+
   const u = new URL(window.location.href);
   return {
     spec: (u.searchParams.get("spec") || "affliction").toLowerCase(),
@@ -104,13 +122,19 @@ function determineActiveHeroSubTreeId(model, selections) {
 
 // --------- decoder (best-effort, tweakable) ---------
 
-function decodeToBits(code) {
+function decodeToBits(code, { alphabet = "std", bitOrder = "lsb" } = {}) {
+  const table = alphabet === "url" ? ALPHABET_URL : ALPHABET;
+
   const bits = [];
   for (const ch of code.trim()) {
-    const idx = ALPHABET.indexOf(ch);
+    const idx = table.indexOf(ch);
     if (idx < 0) continue;
-    // 6 bits, LSB-first
-    for (let b = 0; b < 6; b++) bits.push((idx >> b) & 1);
+
+    if (bitOrder === "lsb") {
+      for (let b = 0; b < 6; b++) bits.push((idx >> b) & 1);
+    } else {
+      for (let b = 5; b >= 0; b--) bits.push((idx >> b) & 1);
+    }
   }
   return bits;
 }
@@ -148,20 +172,56 @@ function bitsNeededForMaxRanks(maxRanks) {
   return 4;
 }
 
-function decodeSelections({ code, model, debug }) {
-  const bits = decodeToBits(code);
+function decodeSelections({ code, model, debug, opts }) {
+  const {
+    headerVarInts = 4,
+    alphabet = "std", // std|url
+    bitOrder = "lsb"  // lsb|msb
+  } = opts || {};
+
+  const bits = decodeToBits(code, { alphabet, bitOrder });
   const br = new BitReader(bits);
 
-  // Header skip (heuristic). If mismatch, adjust later.
-  const h1 = br.readVarInt();
-  const h2 = br.readVarInt();
-  const h3 = br.readVarInt();
-  const h4 = br.readVarInt();
+  const header = [];
+  for (let i = 0; i < headerVarInts; i++) header.push(br.readVarInt());
+  if (debug) console.log("header:", header, { headerVarInts, alphabet, bitOrder });
 
-  if (debug) {
-    // eslint-disable-next-line no-console
-    console.log("header varints:", { h1, h2, h3, h4 });
+  const byNodeId = new Map();
+
+  for (const nodeId of model.fullNodeOrder || []) {
+    const node = model._nodeIndex.get(nodeId);
+
+    // ВАЖНО: чтобы не "съезжать", мы обязаны читать данные даже для неизвестных нод.
+    const maxRanks = node?.maxRanks ?? 1;
+    const nodeType = node?.type ?? "single";
+
+    const taken = br.read(1) === 1;
+
+    let ranksTaken = 0;
+    let choiceEntryIndex = null;
+
+    if (taken) {
+      if (nodeType === "choice") {
+        // чаще всего достаточно 2 бит, но иногда 1 (если всегда 2 опции).
+        // оставим 2, а при калибровке можно будет добавить режим "choiceBits=1"
+        choiceEntryIndex = br.read(2);
+        ranksTaken = 1;
+      } else if (nodeType === "tiered") {
+        ranksTaken = br.read(3);
+        if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+      } else {
+        const bn = bitsNeededForMaxRanks(maxRanks);
+        ranksTaken = bn ? br.read(bn) + 1 : 1;
+        if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+      }
+    }
+
+    if (node) byNodeId.set(nodeId, { taken, ranksTaken, maxRanks, choiceEntryIndex });
   }
+
+  return byNodeId;
+}
+
 
   const byNodeId = new Map();
 
@@ -216,6 +276,64 @@ function computeBounds(nodes) {
   }
   return { minX, minY, maxX, maxY };
 }
+function scoreDecode(model, selections) {
+  // score: +2 за совпадение taken, -2 за расхождение на эталонных нодах
+  let score = 0;
+  for (const id of CALIBRATION.expectedTaken) {
+    const taken = selections.get(id)?.taken === true;
+    if (taken) score += 2;
+    else score -= 2;
+  }
+
+  // hero "all talents": проверим, что для выбранного subTreeId все ноды taken
+  if (CALIBRATION.expectedHeroAll) {
+    const subTree = (model.subTreeNodes || [])[0];
+    if (subTree?.entries?.length) {
+      // берём ветку где больше taken
+      let best = { nodes: [], taken: -1, traitSubTreeId: null };
+      for (const e of subTree.entries) {
+        let cnt = 0;
+        for (const nid of e.nodes || []) if (selections.get(nid)?.taken) cnt++;
+        if (cnt > best.taken) best = { nodes: e.nodes || [], taken: cnt, traitSubTreeId: e.traitSubTreeId };
+      }
+      // хотим, чтобы "все" в этой ветке были taken
+      let all = true;
+      for (const nid of best.nodes) {
+        if (!selections.get(nid)?.taken) { all = false; break; }
+      }
+      score += all ? 10 : -10;
+    }
+  }
+
+  return score;
+}
+
+function calibrateDecoder(model) {
+  const candidates = [];
+
+  for (const alphabet of ["std", "url"]) {
+    for (const bitOrder of ["lsb", "msb"]) {
+      for (let headerVarInts = 0; headerVarInts <= 10; headerVarInts++) {
+        try {
+          const selections = decodeSelections({
+            code: CALIBRATION.code,
+            model,
+            debug: false,
+            opts: { alphabet, bitOrder, headerVarInts }
+          });
+          const score = scoreDecode(model, selections);
+          candidates.push({ alphabet, bitOrder, headerVarInts, score });
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0] || null;
+}
+
 
 function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   svg.innerHTML = "";
@@ -384,6 +502,26 @@ const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.s
   const tooltipEl = document.getElementById("tooltip");
 
   const q = getQuery();
+const models = await loadModels();
+const model = pickModel(models, q.spec);
+
+// 1) если cal=1 — подбираем параметры и печатаем
+let decoderOpts = { headerVarInts: 4, alphabet: "std", bitOrder: "lsb" };
+
+if (q.cal) {
+  const best = calibrateDecoder(model);
+  console.log("BEST DECODER OPTS:", best);
+  if (best) decoderOpts = best;
+}
+
+// 2) обычный декод (для любого code)
+let selections = new Map();
+if (q.code) {
+  selections = decodeSelections({ code: q.code, model, debug: q.debug, opts: decoderOpts });
+}
+
+render(model, selections, svg, tooltipEl, heroKeyToSubTreeId?.(q.hero) ?? null);
+
   const models = await loadModels();
   const model = pickModel(models, q.spec);
 
@@ -393,4 +531,5 @@ const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.s
   }
   const heroSubTreeId = heroKeyToSubTreeId(q.hero);
   render(model, selections, svg, tooltipEl, heroSubTreeId);;
+  
 })();
