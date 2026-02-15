@@ -29,9 +29,11 @@ function getQuery() {
   return {
     spec: (u.searchParams.get("spec") || "affliction").toLowerCase(),
     code: (u.searchParams.get("code") || "").trim(),
+    hero: (u.searchParams.get("hero") || "").toLowerCase(), // <-- добавили
     debug: u.searchParams.get("debug") === "1"
   };
 }
+
 
 function specKeyToName(key) {
   const k = (key || "").toLowerCase();
@@ -39,6 +41,20 @@ function specKeyToName(key) {
   if (k === "demonology") return "Demonology";
   if (k === "destruction") return "Destruction";
   return "Affliction";
+}
+function heroKeyToSubTreeId(heroKey) {
+  // по твоему JSON:
+  // 57 = Soul Harvester
+  // 58 = Hellcaller
+  // 59 = Diabolist
+  if (!heroKey) return null;
+
+  const k = heroKey.toLowerCase();
+  if (k === "soulharvester") return 57;
+  if (k === "hellcaller") return 58;
+  if (k === "diabolist") return 59;
+
+  return null;
 }
 
 async function loadModels() {
@@ -201,7 +217,7 @@ function computeBounds(nodes) {
   return { minX, minY, maxX, maxY };
 }
 
-function render(model, selections, svg, tooltipEl) {
+function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   svg.innerHTML = "";
 
   const W = 1200;
@@ -211,15 +227,12 @@ function render(model, selections, svg, tooltipEl) {
   const activeHeroSubTreeId = determineActiveHeroSubTreeId(model, selections);
 
 const heroNodesFiltered = (model.heroNodes || []).filter((n) => {
-  // Если не удалось определить (например, code пустой), можно:
-  // - либо не показывать hero вообще
-  // - либо показывать обе (как сейчас)
-  // Я сделаю "не показывать hero", чтобы было строго.
-  if (!activeHeroSubTreeId) return false;
-  return n.subTreeId === activeHeroSubTreeId;
+  if (!heroSubTreeId) return false; // если параметр hero не передали — центр пустой
+  return n.subTreeId === heroSubTreeId;
 });
 
 const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.specNodes || [])];
+
 
   const bounds = computeBounds(allNodes);
 
@@ -378,6 +391,6 @@ const allNodes = [...(model.classNodes || []), ...heroNodesFiltered, ...(model.s
   if (q.code) {
     selections = decodeSelections({ code: q.code, model, debug: q.debug });
   }
-
-  render(model, selections, svg, tooltipEl);
+  const heroSubTreeId = heroKeyToSubTreeId(q.hero);
+  render(model, selections, svg, tooltipEl, heroSubTreeId);;
 })();
