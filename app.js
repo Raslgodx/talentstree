@@ -1,16 +1,51 @@
 const WOWHEAD_ICON_BASE = "https://wow.zamimg.com/images/wow/icons/large/";
 const SVG_NS = "http://www.w3.org/2000/svg";
 
-// --------- CALIBRATION (temporary, for cal=1) ---------
+// --------- CALIBRATION (uses your full exported selection list) ---------
 const CALIBRATION = {
   code: "CkQAAAAAAAAAAAAAAAAAAAAAAwMzYGNbjx2MzMzyAAAmZmlZbmZWGDAYBGY2MaMDIzCYZAAAwAAAzMYYMzsNzMzMMzMzMDzMzAAMAA",
+
+  // all nodeIds that must be taken=true for this code
   expectedTaken: new Set([
-    // class (left)
-    71931, 71933, 71949, 71948, 71922, 109847,
-    // spec (right)
-    72049, 72050, 72047, 72032, 109860, 72054, 110269, 72046, 109849, 72034, 109850, 109853
+    72049,
+    109862,
+    72050,
+    72047,
+    72045,
+    72032,
+    109861,
+    72051,
+    72054,
+    72058,
+    109860,
+    110269,
+    72034,
+    72037,
+    109859,
+    72046,
+    109849,
+    71987,
+    109850,
+    72041,
+    109863,
+    109864,
+    109851,
+    109865,
+    102247,
+    109866,
+    109852,
+    109855,
+    72033,
+    109853,
+    109854
   ]),
-  expectedHeroAll: true
+
+  // expected choice pick per node: nodeId -> picked entryId
+  expectedChoicePick: new Map([
+    [72045, 124692],
+    [72051, 91572],
+    [72037, 91558]
+  ])
 };
 
 // --------- helpers ---------
@@ -40,8 +75,7 @@ function getQuery() {
     spec: (u.searchParams.get("spec") || "affliction").toLowerCase(),
     code: (u.searchParams.get("code") || "").trim(),
     hero: (u.searchParams.get("hero") || "").toLowerCase(),
-    debug: u.searchParams.get("debug") === "1",
-    cal: u.searchParams.get("cal") === "1"
+    debug: u.searchParams.get("debug") === "1"
   };
 }
 
@@ -87,7 +121,7 @@ function pickModel(models, specKey) {
   return buildNodeIndex(model);
 }
 
-// --------- BYTE-BASED decoder (correct base64 -> bytes) ---------
+// --------- BYTE-BASED decoder (base64 -> bytes) ---------
 function base64ToBytes(b64) {
   const clean = (b64 || "").trim();
   const padLen = (4 - (clean.length % 4)) % 4;
@@ -130,9 +164,7 @@ class ByteBitReader {
   }
 
   readVarInt() {
-    // WoW varints are byte-aligned
     this.alignToByte();
-
     let shift = 0;
     let out = 0;
     while (true) {
@@ -161,7 +193,7 @@ function decodeSelections({ code, model, debug, opts }) {
   const {
     headerVarInts = 0,
     choiceMode = "byEntryCount", // "byEntryCount" | "fixed1" | "fixed2"
-    choiceExtraBit = false, // NEW: read +1 bit after choiceIndex (if taken)
+    choiceExtraBit = false, // read +1 bit after choiceIndex (if taken)
     rankMode = "plus1" // "plus1" | "raw" | "tiered3"
   } = opts || {};
 
@@ -186,7 +218,6 @@ function decodeSelections({ code, model, debug, opts }) {
   for (const nodeId of model.fullNodeOrder || []) {
     const node = model._nodeIndex.get(nodeId);
 
-    // keep alignment even for unknown nodes
     const maxRanks = node?.maxRanks ?? 1;
     const nodeType = node?.type ?? "single";
 
@@ -205,8 +236,7 @@ function decodeSelections({ code, model, debug, opts }) {
         else cb = entryCount <= 2 ? 1 : 2;
 
         choiceEntryIndex = br.readBits(cb);
-
-        if (choiceExtraBit) br.readBits(1); // NEW
+        if (choiceExtraBit) br.readBits(1);
 
         ranksTaken = 1;
       } else {
@@ -238,99 +268,49 @@ function decodeSelections({ code, model, debug, opts }) {
 }
 
 // --------- debug compare against calibration ---------
-function debugCompareAgainstCalibration(selections) {
+function debugCompareAgainstCalibration(selections, model) {
   const missing = [];
   const extra = [];
 
   for (const id of CALIBRATION.expectedTaken) {
     if (!selections.get(id)?.taken) missing.push(id);
   }
+
   for (const [id, s] of selections.entries()) {
     if (s?.taken && !CALIBRATION.expectedTaken.has(id)) extra.push(id);
   }
 
-  console.log("CALIBRATION missing(expected but not taken):", missing);
-  console.log(
-    "CALIBRATION extra(taken but not expected):",
-    extra.slice(0, 50),
-    extra.length > 50 ? `(and ${extra.length - 50} more)` : ""
-  );
-}
+  const wrongChoice = [];
+  for (const [nodeId, expectedEntryId] of CALIBRATION.expectedChoicePick.entries()) {
+    const node = model._nodeIndex.get(nodeId);
+    const sel = selections.get(nodeId);
 
-// --------- calibration (cal=1) ---------
-function scoreDecode(model, selections) {
-  let score = 0;
+    if (!node || node.type !== "choice") {
+      wrongChoice.push({ nodeId, reason: "not a choice node in model" });
+      continue;
+    }
+    if (!sel?.taken) {
+      wrongChoice.push({ nodeId, reason: "not taken" });
+      continue;
+    }
 
-  // reward for expected taken
-  for (const id of CALIBRATION.expectedTaken) {
-    const taken = selections.get(id)?.taken === true;
-    score += taken ? 5 : -5;
-  }
+    const pickedIndex = sel.choiceEntryIndex;
+    const pickedEntry = typeof pickedIndex === "number" ? node.entries?.[pickedIndex] : null;
+    const pickedEntryId = pickedEntry?.id ?? null;
 
-  // penalty for extras (taken but not expected)
-  let extraCount = 0;
-  for (const [id, s] of selections.entries()) {
-    if (s?.taken && !CALIBRATION.expectedTaken.has(id)) extraCount++;
-  }
-  score -= extraCount * 1; // мягкий штраф
-
-  // hero "all" check (as before)
-  if (CALIBRATION.expectedHeroAll) {
-    const subTree = (model.subTreeNodes || [])[0];
-    if (subTree?.entries?.length) {
-      let best = { nodes: [], taken: -1, traitSubTreeId: null };
-
-      for (const e of subTree.entries) {
-        let cnt = 0;
-        for (const nid of e.nodes || []) if (selections.get(nid)?.taken) cnt++;
-        if (cnt > best.taken) best = { nodes: e.nodes || [], taken: cnt, traitSubTreeId: e.traitSubTreeId };
-      }
-
-      let all = true;
-      for (const nid of best.nodes) {
-        if (!selections.get(nid)?.taken) { all = false; break; }
-      }
-      score += all ? 15 : -15;
+    if (pickedEntryId !== expectedEntryId) {
+      wrongChoice.push({
+        nodeId,
+        expectedEntryId,
+        pickedIndex,
+        pickedEntryId
+      });
     }
   }
 
-  return score;
-}
-
-
-function calibrateDecoder(model) {
-  const candidates = [];
-
-  const headerRange = Array.from({ length: 21 }, (_, i) => i); // 0..20
-
-  const choiceModes = ["byEntryCount", "fixed1", "fixed2"];
-  const choiceExtraBits = [false, true];
-  const rankModes = ["plus1", "raw", "tiered3"];
-
-  for (const headerVarInts of headerRange) {
-    for (const choiceMode of choiceModes) {
-      for (const choiceExtraBit of choiceExtraBits) {
-        for (const rankMode of rankModes) {
-          try {
-            const selections = decodeSelections({
-              code: CALIBRATION.code,
-              model,
-              debug: false,
-              opts: { headerVarInts, choiceMode, choiceExtraBit, rankMode }
-            });
-
-            const score = scoreDecode(model, selections);
-            candidates.push({ headerVarInts, choiceMode, choiceExtraBit, rankMode, score });
-          } catch {
-            // ignore
-          }
-        }
-      }
-    }
-  }
-
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates[0] || null;
+  console.log("CALIBRATION missing(expected but not taken):", missing, "count=", missing.length);
+  console.log("CALIBRATION extra(taken but not expected):", extra.slice(0, 80), "count=", extra.length);
+  console.log("CALIBRATION wrongChoice:", wrongChoice, "count=", wrongChoice.length);
 }
 
 // --------- render ---------
@@ -390,7 +370,6 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
       const m = model._nodeIndex.get(toId);
       if (!m) continue;
 
-      // do not draw edges that go to a hidden hero node
       if (m._tree === "hero" && heroSubTreeId && m.subTreeId !== heroSubTreeId) continue;
 
       const b = toScreen(m.posX, m.posY);
@@ -489,7 +468,7 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
     t.textContent = label;
     g.appendChild(t);
 
-    // tooltip (only title)
+    // tooltip
     g.addEventListener("mousemove", (ev) => {
       const title = entry?.name ?? n.name ?? "Unknown";
       tooltipEl.innerHTML = `<div class="tooltip__title">${escapeHtml(title)}</div>`;
@@ -530,19 +509,13 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
     });
   }
 
-  // Default decoder params (baseline; will be overridden when cal=1 finds better)
-  let decoderOpts = {
+  // Decoder options (manual for now; tweak here)
+  const decoderOpts = {
     headerVarInts: 0,
     choiceMode: "byEntryCount",
     choiceExtraBit: false,
     rankMode: "plus1"
   };
-
-  if (q.cal) {
-    const best = calibrateDecoder(model);
-    console.log("BEST DECODER OPTS:", best);
-    if (best) decoderOpts = best;
-  }
 
   if (q.debug) console.log("DECODER OPTS USED:", decoderOpts);
 
@@ -552,7 +525,7 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   }
 
   if (q.debug && q.code === CALIBRATION.code) {
-    debugCompareAgainstCalibration(selections);
+    debugCompareAgainstCalibration(selections, model);
   }
 
   if (q.debug) {
