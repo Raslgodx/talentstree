@@ -205,20 +205,26 @@ function decodeSelections({ code, model, debug, opts }) {
       } else {
         const bn = bitsNeededForMaxRanks(maxRanks);
 
-        if (bn === 0) {
-          ranksTaken = 1;
-        } else if (rankMode === "raw") {
-          ranksTaken = br.readBits(bn);
-          if (ranksTaken <= 0) ranksTaken = 1;
-          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
-        } else if (rankMode === "tiered3") {
-          ranksTaken = br.readBits(3);
-          if (ranksTaken <= 0) ranksTaken = 1;
-          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
-        } else {
-          ranksTaken = br.readBits(bn) + 1;
-          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
-        }
+if (bn === 0) {
+  ranksTaken = 1;
+} else if (maxRanks === 2) {
+  // частый кейс: хранится "0/1/2" (2 бита), но 0 = 1
+  ranksTaken = br.readBits(2);
+  if (ranksTaken <= 0) ranksTaken = 1;
+  if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+} else if (rankMode === "tiered3") {
+  ranksTaken = br.readBits(3);
+  if (ranksTaken <= 0) ranksTaken = 1;
+  if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+} else if (rankMode === "raw") {
+  ranksTaken = br.readBits(bn);
+  if (ranksTaken <= 0) ranksTaken = 1;
+  if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+} else {
+  ranksTaken = br.readBits(bn) + 1;
+  if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+}
+
       }
     }
 
