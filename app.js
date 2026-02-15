@@ -87,50 +87,69 @@ function pickModel(models, specKey) {
   return buildNodeIndex(model);
 }
 
-// --------- decoder ---------
-const ALPHABET_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const ALPHABET_URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+// --------- BYTE-BASED decoder (correct base64 -> bytes) ---------
+function base64ToBytes(b64) {
+  // Blizzard export uses standard base64 (with + and /), usually no padding.
+  const clean = (b64 || "").trim();
 
-function decodeToBits(code, { alphabet = "std", bitOrder = "lsb" } = {}) {
-  const table = alphabet === "url" ? ALPHABET_URL : ALPHABET_STD;
-  const bits = [];
+  // add missing padding if needed
+  const padLen = (4 - (clean.length % 4)) % 4;
+  const padded = clean + "=".repeat(padLen);
 
-  for (const ch of code.trim()) {
-    const idx = table.indexOf(ch);
-    if (idx < 0) continue;
-
-    if (bitOrder === "lsb") {
-      for (let b = 0; b < 6; b++) bits.push((idx >> b) & 1);
-    } else {
-      for (let b = 5; b >= 0; b--) bits.push((idx >> b) & 1);
-    }
-  }
-
-  return bits;
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
 
-class BitReader {
-  constructor(bits) {
-    this.bits = bits;
-    this.i = 0;
+class ByteBitReader {
+  constructor(bytes) {
+    this.bytes = bytes;
+    this.byteI = 0;
+    this.bitI = 0; // 0..7, LSB-first inside byte
   }
-  read(n) {
+
+  readBits(n) {
     let v = 0;
     for (let b = 0; b < n; b++) {
-      v |= ((this.bits[this.i++] ?? 0) & 1) << b;
+      const cur = this.bytes[this.byteI] ?? 0;
+      const bit = (cur >> this.bitI) & 1;
+      v |= bit << b;
+
+      this.bitI++;
+      if (this.bitI >= 8) {
+        this.bitI = 0;
+        this.byteI++;
+      }
     }
     return v;
   }
+
+  alignToByte() {
+    if (this.bitI !== 0) {
+      this.bitI = 0;
+      this.byteI++;
+    }
+  }
+
   readVarInt() {
+    // WoW varints are byte-aligned
+    this.alignToByte();
+
     let shift = 0;
     let out = 0;
     while (true) {
-      const chunk = this.read(8);
-      out |= (chunk & 0x7f) << shift;
-      if ((chunk & 0x80) === 0) break;
+      const byte = this.bytes[this.byteI++] ?? 0;
+      out |= (byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) break;
       shift += 7;
     }
-    return out;
+    return out >>> 0;
+  }
+
+  bytesLeft() {
+    // rough, not counting partial bit position precisely
+    return Math.max(0, this.bytes.length - this.byteI);
   }
 }
 
@@ -144,19 +163,20 @@ function bitsNeededForMaxRanks(maxRanks) {
 
 function decodeSelections({ code, model, debug, opts }) {
   const {
-    headerVarInts = 4,
-    alphabet = "std",
-    bitOrder = "lsb",
-    choiceBits = 2,      // NEW: 1 or 2
-    rankMode = "plus1"   // NEW: "plus1" | "raw" | "tiered3"
+    headerVarInts = 0,
+    choiceMode = "byEntryCount", // "byEntryCount" | "fixed1" | "fixed2"
+    rankMode = "plus1" // "plus1" | "raw" | "tiered3"
   } = opts || {};
 
-  const bits = decodeToBits(code, { alphabet, bitOrder });
-  const br = new BitReader(bits);
+  const bytes = base64ToBytes(code);
+  const br = new ByteBitReader(bytes);
 
   const header = [];
   for (let i = 0; i < headerVarInts; i++) header.push(br.readVarInt());
-  if (debug) console.log("header:", header, { headerVarInts, alphabet, bitOrder, choiceBits, rankMode });
+
+  if (debug) {
+    console.log("header:", header, { headerVarInts, choiceMode, rankMode, totalBytes: bytes.length });
+  }
 
   const byNodeId = new Map();
 
@@ -166,40 +186,37 @@ function decodeSelections({ code, model, debug, opts }) {
     const maxRanks = node?.maxRanks ?? 1;
     const nodeType = node?.type ?? "single";
 
-    const taken = br.read(1) === 1;
+    const taken = br.readBits(1) === 1;
 
     let ranksTaken = 0;
     let choiceEntryIndex = null;
 
     if (taken) {
       if (nodeType === "choice") {
-  const entryCount = Array.isArray(node?.entries) ? node.entries.length : 2;
+        const entryCount = Array.isArray(node?.entries) ? node.entries.length : 2;
 
-  // 2 варианта -> 1 бит, 3-4 варианта -> 2 бита
-  const cb = entryCount <= 2 ? 1 : 2;
+        let cb = 2;
+        if (choiceMode === "fixed1") cb = 1;
+        else if (choiceMode === "fixed2") cb = 2;
+        else cb = entryCount <= 2 ? 1 : 2;
 
-  choiceEntryIndex = br.read(cb);
-  ranksTaken = 1;
-}
- else {
-        // ranks decoding variants
+        choiceEntryIndex = br.readBits(cb);
+        ranksTaken = 1;
+      } else {
         const bn = bitsNeededForMaxRanks(maxRanks);
 
         if (bn === 0) {
           ranksTaken = 1;
         } else if (rankMode === "raw") {
-          // read raw 0..(2^bn-1), clamp; allow 0 to mean 1
-          ranksTaken = br.read(bn);
+          ranksTaken = br.readBits(bn);
           if (ranksTaken <= 0) ranksTaken = 1;
           if (ranksTaken > maxRanks) ranksTaken = maxRanks;
         } else if (rankMode === "tiered3") {
-          // always 3 bits for ranks when taken
-          ranksTaken = br.read(3);
+          ranksTaken = br.readBits(3);
           if (ranksTaken <= 0) ranksTaken = 1;
           if (ranksTaken > maxRanks) ranksTaken = maxRanks;
         } else {
-          // "plus1"
-          ranksTaken = br.read(bn) + 1;
+          ranksTaken = br.readBits(bn) + 1;
           if (ranksTaken > maxRanks) ranksTaken = maxRanks;
         }
       }
@@ -208,8 +225,14 @@ function decodeSelections({ code, model, debug, opts }) {
     if (node) byNodeId.set(nodeId, { taken, ranksTaken, maxRanks, choiceEntryIndex });
   }
 
+  if (debug) {
+    console.log("decode tail:", { bytesLeft: br.bytesLeft() });
+  }
+
   return byNodeId;
 }
+
+// --------- debug compare against calibration ---------
 function debugCompareAgainstCalibration(selections) {
   const missing = [];
   const extra = [];
@@ -217,17 +240,17 @@ function debugCompareAgainstCalibration(selections) {
   for (const id of CALIBRATION.expectedTaken) {
     if (!selections.get(id)?.taken) missing.push(id);
   }
-
-  // extras: taken=true, но не ожидается (ограничим вывод 50)
   for (const [id, s] of selections.entries()) {
     if (s?.taken && !CALIBRATION.expectedTaken.has(id)) extra.push(id);
   }
 
   console.log("CALIBRATION missing(expected but not taken):", missing);
-  console.log("CALIBRATION extra(taken but not expected):", extra.slice(0, 50), extra.length > 50 ? `(and ${extra.length - 50} more)` : "");
+  console.log(
+    "CALIBRATION extra(taken but not expected):",
+    extra.slice(0, 50),
+    extra.length > 50 ? `(and ${extra.length - 50} more)` : ""
+  );
 }
-
-
 
 // --------- calibration (cal=1) ---------
 function scoreDecode(model, selections) {
@@ -256,7 +279,6 @@ function scoreDecode(model, selections) {
           break;
         }
       }
-
       score += all ? 10 : -10;
     }
   }
@@ -267,25 +289,25 @@ function scoreDecode(model, selections) {
 function calibrateDecoder(model) {
   const candidates = [];
 
-  for (const alphabet of ["std", "url"]) {
-    for (const bitOrder of ["lsb", "msb"]) {
-      for (const headerVarInts of Array.from({ length: 21 }, (_, i) => i)) { // 0..20
-        for (const choiceBits of [1, 2]) {
-          for (const rankMode of ["plus1", "raw", "tiered3"]) {
-            try {
-              const selections = decodeSelections({
-                code: CALIBRATION.code,
-                model,
-                debug: false,
-                opts: { alphabet, bitOrder, headerVarInts, choiceBits, rankMode }
-              });
+  const headerRange = Array.from({ length: 33 }, (_, i) => i); // 0..32
+  const choiceModes = ["byEntryCount", "fixed1", "fixed2"];
+  const rankModes = ["plus1", "raw", "tiered3"];
 
-              const score = scoreDecode(model, selections);
-              candidates.push({ alphabet, bitOrder, headerVarInts, choiceBits, rankMode, score });
-            } catch {
-              // ignore
-            }
-          }
+  for (const headerVarInts of headerRange) {
+    for (const choiceMode of choiceModes) {
+      for (const rankMode of rankModes) {
+        try {
+          const selections = decodeSelections({
+            code: CALIBRATION.code,
+            model,
+            debug: false,
+            opts: { headerVarInts, choiceMode, rankMode }
+          });
+
+          const score = scoreDecode(model, selections);
+          candidates.push({ headerVarInts, choiceMode, rankMode, score });
+        } catch {
+          // ignore
         }
       }
     }
@@ -294,7 +316,6 @@ function calibrateDecoder(model) {
   candidates.sort((a, b) => b.score - a.score);
   return candidates[0] || null;
 }
-
 
 // --------- render ---------
 function computeBounds(nodes) {
@@ -478,36 +499,54 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   const tooltipEl = document.getElementById("tooltip");
 
   const q = getQuery();
+
+  if (q.debug) console.log("APP START", q);
+
   const models = await loadModels();
   const model = pickModel(models, q.spec);
 
-  // дефолтные параметры декодера (найденные калибровкой)
+  if (q.debug) {
+    console.log("MODEL", {
+      spec: q.spec,
+      fullNodeOrder: model.fullNodeOrder?.length,
+      classNodes: model.classNodes?.length,
+      heroNodes: model.heroNodes?.length,
+      specNodes: model.specNodes?.length
+    });
+  }
+
+  // Default decoder params (will be overridden when cal=1 finds better)
   let decoderOpts = {
-    alphabet: "std",
-    bitOrder: "lsb",
-    headerVarInts: 17,
-    choiceBits: 2,
+    headerVarInts: 0,
+    choiceMode: "byEntryCount",
     rankMode: "plus1"
   };
 
-  // если включили cal=1 — пробуем подобрать лучше и подменяем opts
   if (q.cal) {
     const best = calibrateDecoder(model);
     console.log("BEST DECODER OPTS:", best);
     if (best) decoderOpts = best;
   }
 
-  // декодим строку
+  if (q.debug) console.log("DECODER OPTS USED:", decoderOpts);
+
   let selections = new Map();
   if (q.code) {
     selections = decodeSelections({ code: q.code, model, debug: q.debug, opts: decoderOpts });
   }
 
-  // debug сравнение — ТОЛЬКО ПОСЛЕ того, как selections уже есть
   if (q.debug && q.code === CALIBRATION.code) {
     debugCompareAgainstCalibration(selections);
   }
 
+  if (q.debug) {
+    const takenCount = [...selections.values()].filter((s) => s?.taken).length;
+    console.log("TAKEN COUNT:", takenCount);
+  }
+
   const heroSubTreeId = heroKeyToSubTreeId(q.hero);
   render(model, selections, svg, tooltipEl, heroSubTreeId);
-})();
+})().catch((e) => {
+  // eslint-disable-next-line no-console
+  console.error("APP CRASH:", e);
+});
