@@ -89,10 +89,7 @@ function pickModel(models, specKey) {
 
 // --------- BYTE-BASED decoder (correct base64 -> bytes) ---------
 function base64ToBytes(b64) {
-  // Blizzard export uses standard base64 (with + and /), usually no padding.
   const clean = (b64 || "").trim();
-
-  // add missing padding if needed
   const padLen = (4 - (clean.length % 4)) % 4;
   const padded = clean + "=".repeat(padLen);
 
@@ -106,7 +103,7 @@ class ByteBitReader {
   constructor(bytes) {
     this.bytes = bytes;
     this.byteI = 0;
-    this.bitI = 0; // 0..7, LSB-first inside byte
+    this.bitI = 0; // 0..7, LSB-first within each byte
   }
 
   readBits(n) {
@@ -148,7 +145,6 @@ class ByteBitReader {
   }
 
   bytesLeft() {
-    // rough, not counting partial bit position precisely
     return Math.max(0, this.bytes.length - this.byteI);
   }
 }
@@ -165,6 +161,7 @@ function decodeSelections({ code, model, debug, opts }) {
   const {
     headerVarInts = 0,
     choiceMode = "byEntryCount", // "byEntryCount" | "fixed1" | "fixed2"
+    choiceExtraBit = false, // NEW: read +1 bit after choiceIndex (if taken)
     rankMode = "plus1" // "plus1" | "raw" | "tiered3"
   } = opts || {};
 
@@ -175,7 +172,13 @@ function decodeSelections({ code, model, debug, opts }) {
   for (let i = 0; i < headerVarInts; i++) header.push(br.readVarInt());
 
   if (debug) {
-    console.log("header:", header, { headerVarInts, choiceMode, rankMode, totalBytes: bytes.length });
+    console.log("header:", header, {
+      headerVarInts,
+      choiceMode,
+      choiceExtraBit,
+      rankMode,
+      totalBytes: bytes.length
+    });
   }
 
   const byNodeId = new Map();
@@ -183,6 +186,7 @@ function decodeSelections({ code, model, debug, opts }) {
   for (const nodeId of model.fullNodeOrder || []) {
     const node = model._nodeIndex.get(nodeId);
 
+    // keep alignment even for unknown nodes
     const maxRanks = node?.maxRanks ?? 1;
     const nodeType = node?.type ?? "single";
 
@@ -201,39 +205,34 @@ function decodeSelections({ code, model, debug, opts }) {
         else cb = entryCount <= 2 ? 1 : 2;
 
         choiceEntryIndex = br.readBits(cb);
+
+        if (choiceExtraBit) br.readBits(1); // NEW
+
         ranksTaken = 1;
       } else {
         const bn = bitsNeededForMaxRanks(maxRanks);
 
-if (bn === 0) {
-  ranksTaken = 1;
-} else if (maxRanks === 2) {
-  // частый кейс: хранится "0/1/2" (2 бита), но 0 = 1
-  ranksTaken = br.readBits(2);
-  if (ranksTaken <= 0) ranksTaken = 1;
-  if (ranksTaken > maxRanks) ranksTaken = maxRanks;
-} else if (rankMode === "tiered3") {
-  ranksTaken = br.readBits(3);
-  if (ranksTaken <= 0) ranksTaken = 1;
-  if (ranksTaken > maxRanks) ranksTaken = maxRanks;
-} else if (rankMode === "raw") {
-  ranksTaken = br.readBits(bn);
-  if (ranksTaken <= 0) ranksTaken = 1;
-  if (ranksTaken > maxRanks) ranksTaken = maxRanks;
-} else {
-  ranksTaken = br.readBits(bn) + 1;
-  if (ranksTaken > maxRanks) ranksTaken = maxRanks;
-}
-
+        if (bn === 0) {
+          ranksTaken = 1;
+        } else if (rankMode === "raw") {
+          ranksTaken = br.readBits(bn);
+          if (ranksTaken <= 0) ranksTaken = 1;
+          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+        } else if (rankMode === "tiered3") {
+          ranksTaken = br.readBits(3);
+          if (ranksTaken <= 0) ranksTaken = 1;
+          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+        } else {
+          ranksTaken = br.readBits(bn) + 1;
+          if (ranksTaken > maxRanks) ranksTaken = maxRanks;
+        }
       }
     }
 
     if (node) byNodeId.set(nodeId, { taken, ranksTaken, maxRanks, choiceEntryIndex });
   }
 
-  if (debug) {
-    console.log("decode tail:", { bytesLeft: br.bytesLeft() });
-  }
+  if (debug) console.log("decode tail:", { bytesLeft: br.bytesLeft() });
 
   return byNodeId;
 }
@@ -295,25 +294,28 @@ function scoreDecode(model, selections) {
 function calibrateDecoder(model) {
   const candidates = [];
 
-  const headerRange = Array.from({ length: 33 }, (_, i) => i); // 0..32
+  const headerRange = Array.from({ length: 41 }, (_, i) => i); // 0..40
   const choiceModes = ["byEntryCount", "fixed1", "fixed2"];
+  const choiceExtraBits = [false, true];
   const rankModes = ["plus1", "raw", "tiered3"];
 
   for (const headerVarInts of headerRange) {
     for (const choiceMode of choiceModes) {
-      for (const rankMode of rankModes) {
-        try {
-          const selections = decodeSelections({
-            code: CALIBRATION.code,
-            model,
-            debug: false,
-            opts: { headerVarInts, choiceMode, rankMode }
-          });
+      for (const choiceExtraBit of choiceExtraBits) {
+        for (const rankMode of rankModes) {
+          try {
+            const selections = decodeSelections({
+              code: CALIBRATION.code,
+              model,
+              debug: false,
+              opts: { headerVarInts, choiceMode, choiceExtraBit, rankMode }
+            });
 
-          const score = scoreDecode(model, selections);
-          candidates.push({ headerVarInts, choiceMode, rankMode, score });
-        } catch {
-          // ignore
+            const score = scoreDecode(model, selections);
+            candidates.push({ headerVarInts, choiceMode, choiceExtraBit, rankMode, score });
+          } catch {
+            // ignore
+          }
         }
       }
     }
@@ -505,7 +507,6 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   const tooltipEl = document.getElementById("tooltip");
 
   const q = getQuery();
-
   if (q.debug) console.log("APP START", q);
 
   const models = await loadModels();
@@ -521,10 +522,11 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
     });
   }
 
-  // Default decoder params (will be overridden when cal=1 finds better)
+  // Default decoder params (baseline; will be overridden when cal=1 finds better)
   let decoderOpts = {
     headerVarInts: 0,
     choiceMode: "byEntryCount",
+    choiceExtraBit: false,
     rankMode: "plus1"
   };
 
@@ -553,6 +555,5 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   const heroSubTreeId = heroKeyToSubTreeId(q.hero);
   render(model, selections, svg, tooltipEl, heroSubTreeId);
 })().catch((e) => {
-  // eslint-disable-next-line no-console
   console.error("APP CRASH:", e);
 });
