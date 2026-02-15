@@ -475,28 +475,31 @@ function render(model, selections, svg, tooltipEl, heroSubTreeId) {
   const models = await loadModels();
   const model = pickModel(models, q.spec);
 
-  // Default decoder params (will be overridden when cal=1 finds better)
+  // дефолтные параметры декодера (найденные калибровкой)
   let decoderOpts = {
-  alphabet: "std",
-  bitOrder: "lsb",
-  headerVarInts: 17,
-  choiceBits: 2,
-  rankMode: "plus1"
-};
-  if (q.debug && q.code === CALIBRATION.code) {
-  debugCompareAgainstCalibration(selections);
-}
+    alphabet: "std",
+    bitOrder: "lsb",
+    headerVarInts: 17,
+    choiceBits: 2,
+    rankMode: "plus1"
+  };
 
-
+  // если включили cal=1 — пробуем подобрать лучше и подменяем opts
   if (q.cal) {
     const best = calibrateDecoder(model);
     console.log("BEST DECODER OPTS:", best);
     if (best) decoderOpts = best;
   }
 
+  // декодим строку
   let selections = new Map();
   if (q.code) {
     selections = decodeSelections({ code: q.code, model, debug: q.debug, opts: decoderOpts });
+  }
+
+  // debug сравнение — ТОЛЬКО ПОСЛЕ того, как selections уже есть
+  if (q.debug && q.code === CALIBRATION.code) {
+    debugCompareAgainstCalibration(selections);
   }
 
   const heroSubTreeId = heroKeyToSubTreeId(q.hero);
